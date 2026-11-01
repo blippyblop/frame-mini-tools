@@ -1,22 +1,29 @@
 #!/bin/bash
 # Frame (SteamOS) — control SteamVR's "Controller battery low" popover, userspace only.
 #
+# Two things this script is careful about:
+#  1. The ACTIVE SteamVR runtime is whatever `steamvr path` reports (the OS
+#     supports a Steam-managed runtime under /home; /opt/steamvr is only the
+#     immutable fallback). Patches go to the ACTIVE runtime by default; use
+#     -f/--fallback to target /opt/steamvr explicitly.
+#  2. The threshold site is located by machine-code signature, not offset, and
+#     the CURRENT threshold is reported before patching (stock OS image = 15%).
+#
 # The popover threshold lives in vrmonitor: it reads Prop_DeviceBatteryPercentage_Float
-# (0..1) and compares battery < THRESHOLD (stock THRESHOLD = 0.15, i.e. 15%).
-# Machine code (aarch64, vrmonitor+0x1562f8 in the 2026-09 image):
-#   fcvt d0,s0 | orr x0,#0x3333333333333333 | movk x0,#0x3fc3,lsl#48 | fmov d1,x0 |
+# (0..1) and compares battery < THRESHOLD. Machine code (aarch64):
+#   fcvt d0,s0 | orr x0,#<pattern> | movk x0,#<exp>,lsl#48 | fmov d1,x0 |
 #   ldr x19,[sp,#0x10] | fcmpe d0,d1 | ldp | cset w0,mi        (w0 = battery < threshold)
-# 'pct' rewrites the orr+movk pair to encode any supported threshold (see below).
+# 'pct' rewrites the orr+movk pair to encode any supported threshold.
 #
 # Modes:
 #   off        blank Popover_LowBattery_Controller_* tokens in all vrmonitor_errors_*.txt
 #   binary     patch vrmonitor: _LowBattery -> _LowBatterx (state never matches)
 #   pct <N>    patch the low-battery threshold in vrmonitor to N percent (0..100,
-#              half-percent steps; 0 = never notify, 100 = always notify). Reversible.
+#              half-steps; 0 = never notify, 100 = always). Reversible.
 #   dnd        set notifications.DoNotDisturb=true in steamvr.vrsettings
-#   status     show what is currently applied
+#   status     show active runtime + what is currently applied there and in /opt/steamvr
 #   restore    undo off/binary/pct from the *.lowbatt-backup copies
-# Run on the Frame:  sudo bash frame-lowbatt-notif.sh off
+# Run on the Frame:  sudo bash frame-lowbatt-notif.sh status
 set -euo pipefail
 
 usage() {
@@ -24,47 +31,42 @@ usage() {
 frame-lowbatt-notif.sh — control SteamVR's "Controller battery low" popover on the
 Steam Frame, userspace only (no kernel/firmware changes).
 
-The popover is rendered by vrmonitor (status popover, tokens Popover_LowBattery_*).
-It fires when a device's battery drops below a hardcoded 15% threshold.
-Full mechanism: /workspace/analysis/controller-lowbatt-notif.md
+IMPORTANT: patches apply to the ACTIVE SteamVR runtime (`steamvr path`), which may
+be a Steam-managed runtime under /home rather than the /opt/steamvr OS fallback.
+`status` shows both. SteamVR runtime updates revert patches (re-run after updates).
 
 Usage:
-  frame-lowbatt-notif.sh off        blank the Popover_LowBattery_Controller_* tokens
-                                    in every vrmonitor_errors_*.txt (UTF-16-safe,
-                                    backups kept as *.lowbatt-backup)
-  frame-lowbatt-notif.sh binary     hard kill: 1-byte patch of vrmonitor's _LowBattery
-                                    state string -> state never matches, no popover
-  frame-lowbatt-notif.sh pct <N>    change the threshold percentage instead of killing
-                                    the popover. N in percent, 0..100 in half-steps
-                                    (0 = never notify, 15 = stock, 100 = always).
-                                    Supported N: 0 2.5 5 7.5 10 12.5 15 17.5 20 22.5 25
-                                    27.5 30 32.5 35 37.5 40 42.5 45 47.5 50 52.5 55
-                                    57.5 60 62.5 65 70 72.5 75 80 85 87.5 90 95 100
-  frame-lowbatt-notif.sh dnd        set notifications.DoNotDisturb=true in
-                                    steamvr.vrsettings (other system-layer toasts)
-  frame-lowbatt-notif.sh status     report current off/binary/pct state
-  frame-lowbatt-notif.sh restore    undo off/binary/pct from the .lowbatt-backup copies
-  frame-lowbatt-notif.sh -h|--help  this help
+  frame-lowbatt-notif.sh status       active runtime, current threshold, applied patches
+  frame-lowbatt-notif.sh pct <N>      set the low-battery threshold to N percent
+                                      (half-steps 0..100; 0 = never, 100 = always)
+  frame-lowbatt-notif.sh off          blank Popover_LowBattery_Controller_* tokens in
+                                      every vrmonitor_errors_*.txt (UTF-16-safe)
+  frame-lowbatt-notif.sh binary       1-byte vrmonitor patch: _LowBattery -> _LowBatterx
+  frame-lowbatt-notif.sh dnd          notifications.DoNotDisturb=true in steamvr.vrsettings
+  frame-lowbatt-notif.sh restore      undo off/binary/pct from .lowbatt-backup copies
+  frame-lowbatt-notif.sh -f <mode> …  force the /opt/steamvr fallback runtime instead
+  frame-lowbatt-notif.sh -h|--help    this help
+
+Supported pct values (aarch64-encodable):
+  0 2.5 5 7.5 10 12.5 15 17.5 20 22.5 25 27.5 30 32.5 35 37.5 40 42.5 45 47.5 50
+  55 60 62.5 65 70 75 80 85 87.5 90 95 100
 
 Notes:
-  - 'off'/'binary'/'pct' write to /opt/steamvr on the read-only rootfs:
-    run 'sudo steamos-readonly disable' once first (re-enable afterwards).
-  - Restart SteamVR (or reboot) after off/binary/pct; OS updates revert them.
-  - pct affects HMD + controller + tracker popovers alike (same check); it does NOT
-    change the battery icon colouring thresholds elsewhere.
+  - /opt/steamvr sits on the read-only/verity rootfs: run
+    'sudo steamos-readonly disable' once first (re-enable afterwards).
+  - A Steam-managed runtime under /home is writable; no readonly dance needed.
+  - Restart SteamVR (or reboot) after off/binary/pct.
   - off/binary/pct share the vrmonitor backup; restore undoes all of them at once.
 EOF
 }
 
-STEAMVR=${STEAMVR:-/opt/steamvr}   # override for testing against extracted firmware
-TRDIR=$STEAMVR/content/vrmonitor/translations
-VRMON=$STEAMVR/bin/linuxarm64/vrmonitor
+FALLBACK_RTV=/opt/steamvr
 CFGDIR=${CFGDIR:-/home/steamos/.local/share/Steam/config}
 TOKENS='Popover_LowBattery_Controller_(Header|Description|Action|ActionURL)'
 
 # pct -> orr-word top16-of-movk  (threshold double = top16<<48 | orr-pattern-low48)
-# stock: 15 b200e7e0 3fc3  (= double 0.15). Generated + verified against aarch64
-# ORR-bitmask encodings; see analysis/controller-lowbatt-notif.md.
+# stock OS image: 15 b200e7e0 3fc3 (= double 0.15). Generated + verified against
+# aarch64 ORR-bitmask encodings; see analysis/controller-lowbatt-notif.md.
 PCT_TABLE='
 0 aa1f03e0 0000
 2.5 b201e7e0 3f99
@@ -101,19 +103,35 @@ PCT_TABLE='
 100 aa1f03e0 3ff0
 '
 
+# --- runtime selection ------------------------------------------------------
+
+RUNTIME="$FALLBACK_RTV"
+RUNTIME_TAG="fallback (/opt/steamvr)"
+if [ "${1:-}" = "-f" ] || [ "${1:-}" = "--fallback" ]; then shift; fi
+# (env STEAMVR overrides everything — used for testing against extracted firmware)
+if [ -n "${STEAMVR:-}" ]; then
+  RUNTIME="$STEAMVR"; RUNTIME_TAG="env override ($STEAMVR)"
+elif command -v steamvr >/dev/null 2>&1; then
+  p=$(steamvr path 2>/dev/null || true)
+  if [ -n "$p" ] && [ -f "$p/bin/linuxarm64/vrmonitor" ]; then
+    RUNTIME=$(readlink -f "$p" 2>/dev/null || echo "$p")
+    RUNTIME_TAG="active per 'steamvr path'"
+  fi
+fi
+TRDIR=$RUNTIME/content/vrmonitor/translations
+VRMON=$RUNTIME/bin/linuxarm64/vrmonitor
+
 writable_root_note() {
-  if [ ! -w "$STEAMVR" ]; then
-    echo "ERROR: $STEAMVR is not writable (read-only/verity rootfs)." >&2
-    echo "Run once first:  sudo steamos-readonly disable" >&2
+  if [ ! -w "$RUNTIME" ]; then
+    echo "ERROR: $RUNTIME is not writable (read-only/verity rootfs?)." >&2
+    echo "Run once first:  sudo steamos-readonly disable   (re-enable afterwards)" >&2
     exit 1
   fi
 }
 
-# --- vrmonitor threshold site helpers -------------------------------------
+# --- vrmonitor threshold site helpers ---------------------------------------
 
-word_at() {  # $1=file-offset (bytes) -> 8 lowercase hex chars
-  od -An -tx4 -j "$1" -N 4 "$VRMON" | tr -d ' \n'
-}
+word_at() { od -An -tx4 -j "$1" -N 4 "$VRMON" | tr -d ' \n'; }
 
 put_word() {  # $1=file-offset, $2=hex word (little-endian write)
   local off=$1 w=$2 out="" i b
@@ -124,14 +142,13 @@ put_word() {  # $1=file-offset, $2=hex word (little-endian write)
   printf "$out" | dd of="$VRMON" bs=1 seek="$off" conv=notrunc status=none
 }
 
-# Locate the threshold site; echoes the file offset of the movk instruction.
-# Site layout (word offsets relative to movk at 0):
+# Locate the threshold site; echoes file offset of the movk instruction.
+# Layout (words relative to movk at 0):
 #  -2 fcvt d0,s0 (1e22c000) | -1 orr x0,imm | 0 movk x0,imm16,lsl#48 |
 #  +1 fmov d1,x0 (9e670001) | +2 ldr x19,[sp,#0x10] (f9400bf3) |
 #  +3 fcmpe d0,d1 (1e612010) | +5 cset w0,mi (1a9f57e0)
 find_site() {
   local cand c m
-  # fcmpe d0,d1 has no NUL bytes -> greppable; anchor the site on it.
   while read -r cand; do
     [ -n "$cand" ] || continue
     m=$(( cand - 12 ))
@@ -147,42 +164,52 @@ find_site() {
   return 1
 }
 
-current_pct() {  # echoes "<pct>" if the (orr,movk) pair matches the table, else "custom"/"stock-unknown"
-  local site orr movk top
+current_pct() {  # echoes "<pct>" when the (orr,movk) pair matches the table, else "custom"
+  local site orr movk top pct_line
   site=$(find_site) || { echo "nosite"; return; }
   orr=$(word_at $((site - 4)))
   movk=$(word_at "$site")
   top=$(printf '%04x' $(( (0x$movk >> 5) & 0xffff )))
-  local pct_line
   while read -r pct_line; do
     [ -n "$pct_line" ] || continue
     set -- $pct_line
     if [ "$2" = "$orr" ] && [ "$3" = "$top" ]; then echo "$1"; return; fi
   done <<< "$PCT_TABLE"
-  if [ "$orr" = "b200e7e0" ]; then echo "custom"; else echo "custom"; fi
+  echo "custom"
 }
 
-# --- modes -----------------------------------------------------------------
+pct_status_line() {  # for status: description of the threshold state of $VRMON
+  case "$(current_pct)" in
+    nosite) echo "threshold site NOT FOUND in this vrmonitor build" ;;
+    custom) echo "threshold = custom/unknown value (patched by something else?)" ;;
+    *)      echo "threshold = $(current_pct)%" ;;
+  esac
+}
+
+# --- modes ------------------------------------------------------------------
 
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
   status)
+    echo "patching runtime: $RUNTIME  [$RUNTIME_TAG]"
     echo "vrmonitor:        $VRMON"
+    echo "  $(pct_status_line)"
     if grep -aq '_LowBattery' "$VRMON" 2>/dev/null; then
-      echo "binary patch:     not applied (_LowBattery string present)"
+      echo "  binary patch:     not applied (_LowBattery string present)"
     else
-      echo "binary patch:     APPLIED (_LowBattery string gone)"
+      echo "  binary patch:     APPLIED (_LowBattery string gone)"
     fi
-    case "$(current_pct)" in
-      nosite)  echo "pct patch:        threshold site not found (unexpected build?)" ;;
-      custom)  echo "pct patch:        threshold = custom/unknown value" ;;
-      *)       echo "pct patch:        threshold = $(current_pct)% (stock is 15%)" ;;
-    esac
     if ls "$TRDIR"/vrmonitor_errors_*.txt >/dev/null 2>&1 && \
        [ -e "$(ls "$TRDIR"/vrmonitor_errors_*.txt | head -1).lowbatt-backup" ]; then
-      echo "translation blank: applied (off mode backups present)"
+      echo "  translation blank: applied (off mode backups present)"
     else
-      echo "translation blank: not applied"
+      echo "  translation blank: not applied"
+    fi
+    echo "fallback runtime: $FALLBACK_RTV"
+    if [ -x "$FALLBACK_RTV/bin/linuxarm64/vrmonitor" ]; then
+      VRMON=$FALLBACK_RTV/bin/linuxarm64/vrmonitor
+      echo "  $(pct_status_line)"
+      echo "  (use '$0 -f pct <N>' to patch the fallback explicitly)"
     fi
     ;;
   off)
@@ -219,13 +246,15 @@ case "${1:-}" in
       echo "supported:$(awk '{printf " %s", $1}' <<< "$PCT_TABLE")" >&2
       exit 2
     fi
+    [ -x "$VRMON" ] || { echo "ERROR: $VRMON not found" >&2; exit 1; }
+    cur=$(current_pct)
+    if [ "$cur" = "$want" ]; then echo "threshold already ${want}% ($VRMON)"; exit 0; fi
     site=$(find_site) || { echo "ERROR: threshold site not found in $VRMON (unexpected build)" >&2; exit 1; }
     set -- $entry
     b="$VRMON.lowbatt-backup"; [ -e "$b" ] || cp -p "$VRMON" "$b"
-    cur=$(current_pct)
-    if [ "$cur" = "$want" ]; then echo "threshold already ${want}%"; exit 0; fi
     put_word $((site - 4)) "$1"   # orr x0, #pattern
     put_word "$site" "$(printf 'f2e00000%x' $(( 0x$2 << 5 )))"  # movk x0,#top,lsl#48
+    echo "runtime: $RUNTIME [$RUNTIME_TAG]"
     echo "threshold: ${cur:-?}% -> ${want}%  (patched $VRMON, backup: $b). Restart SteamVR."
     if [ "$want" = "0" ]; then
       echo "  (0% = battery < 0 never true -> notification effectively off)"
@@ -248,5 +277,5 @@ case "${1:-}" in
     done
     ;;
   *)
-    echo "usage: $0 off|binary|pct <N>|dnd|status|restore  (-h for details)" >&2; exit 2 ;;
+    echo "usage: $0 [-f] status|off|binary|pct <N>|dnd|restore  (-h for details)" >&2; exit 2 ;;
 esac
