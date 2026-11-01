@@ -2,14 +2,52 @@
 
 Scripts you copy to the Steam Frame headset and run there (SteamOS).
 
+## frame-screenshot-format.sh — screenshot destination/format (no root, no ro-writes)
+
+**Why your in-VR screenshots are JPG:** the compositor saves a PNG to
+`../../screenshots` relative to its CWD; `select_steamvr.sh` sets that CWD to
+`<runtime>/bin/linuxarm64`, i.e. `<runtime>/screenshots`. With `/opt/steamvr`
+that directory doesn't exist and the rootfs is read-only — the PNG write fails
+silently and only the JPG the Steam client encodes survives.
+
+**The fix never touches the read-only fs.** `shadow on` builds a shadow runtime
+under `$HOME` — real `bin/linuxarm64` dir (per-file symlinks to `/opt/steamvr`,
+plus a real writable copy of `vrmonitor`), symlinks for the rest, and a real
+`screenshots/` dir — then points the OS at it with the supported
+`steamvr setpath` (steamvr.service re-applies it every boot):
+```bash
+bash frame-screenshot-format.sh shadow on       # build + setpath
+bash frame-screenshot-format.sh shadow status   # active runtime, PNG count, drift
+bash frame-screenshot-format.sh shadow off      # setpath back to /opt/steamvr
+bash frame-screenshot-format.sh shadow off --purge   # also delete the shadow dir
+```
+After `shadow on`, restart SteamVR. In-VR PNGs land in
+`~/.steamvr-shadow/screenshots/`. Steam's own library copy stays JPG — that
+encoder lives in the Steam client, not SteamVR. Re-run `shadow on` after OS
+updates to re-sync symlinks / refresh the vrmonitor copy.
+Because the shadow's `vrmonitor` is a real writable copy, this also unblocks
+`frame-lowbatt-notif.sh pct` with **no root and no verity changes**.
+
+Dev helper `screenshot` (`/etc/bashrc.d/vrshortcuts.sh`, ffmpeg grab of
+`/dev/video99`): `png` / `jpg` flip its default extension. NOTE: `/etc` is on
+the read-only rootfs — this is the only mode needing
+`sudo steamos-readonly disable`, and current images already ship `.png`, so you
+likely never need it. `restore` undoes the helper edit.
+```bash
+sudo bash frame-screenshot-format.sh png|jpg
+bash frame-screenshot-format.sh status
+sudo bash frame-screenshot-format.sh restore
+```
+
 ## frame-lowbatt-notif.sh — control "Controller battery low" notifications
 
-**Patches the ACTIVE SteamVR runtime** (`steamvr path` — which may be a
-Steam-managed runtime under `/home`; `/opt/steamvr` is only the immutable
-fallback). Use `-f` to force the fallback, `status` shows both.
+**Patches the ACTIVE SteamVR runtime** (`steamvr path`). Default = `/opt/steamvr`
+(read-only: needs `sudo steamos-readonly disable`, or use the shadow runtime
+above and it just works without root). `-f` forces the fallback; `status` shows
+both and reports the *current* threshold.
 ```bash
-sudo bash frame-lowbatt-notif.sh status      # active runtime, current threshold, applied patches
-sudo bash frame-lowbatt-notif.sh pct 30      # notify at 30% instead of the current threshold
+bash frame-lowbatt-notif.sh status           # active runtime, current threshold, patches
+sudo bash frame-lowbatt-notif.sh pct 30      # notify at 30% instead of current
 sudo bash frame-lowbatt-notif.sh pct 0       # never notify (clean "off" via threshold)
 sudo bash frame-lowbatt-notif.sh pct 100     # always notify (testing the popover)
 sudo bash frame-lowbatt-notif.sh off         # blank the popover tokens (reversible)
@@ -18,58 +56,18 @@ sudo bash frame-lowbatt-notif.sh binary      # 1-byte vrmonitor patch (hard kill
 sudo bash frame-lowbatt-notif.sh restore     # undo off/binary/pct from backups
 ```
 
-The popover threshold lives in vrmonitor as a hardcoded `battery < X` check
-(machine-code signature, located and reported before patching — the stock OS
-image ships X = 15%, so a device notifying at 20% is running a different
-runtime/build; `status` tells you what yours uses and `pct` rewrites it).
-`pct` supports half-steps 0–100 whose double is aarch64-encodable; anything
-else is rejected with the supported list.
+The threshold is a hardcoded `battery < X` check in vrmonitor, located by
+machine-code signature; the OS image ships X = 15% (the script reports what
+*your* build uses before patching). `pct` supports half-steps 0–100 whose
+double is aarch64-encodable; anything else is rejected with the supported list.
 `off` blanks the `Popover_LowBattery_Controller_*` tokens in
 `content/vrmonitor/translations/vrmonitor_errors_*.txt` (UTF-16LE); `binary`
-1-byte-patches vrmonitor's `_LowBattery` state string.
-`off`/`binary`/`pct` on `/opt/steamvr` need `sudo steamos-readonly disable`
-once (re-enable after); a Steam-managed runtime under `/home` is writable.
-Backups: `*.lowbatt-backup` next to each patched file (`restore` undoes all).
-SteamVR runtime updates revert patches — re-run after updates.
+1-byte-patches vrmonitor's `_LowBattery` state string. Backups:
+`*.lowbatt-backup` next to each patched file (`restore` undoes all).
+SteamVR updates revert patches — re-run after updates.
 
 Full mechanism + evidence (incl. the patched instructions):
 `/workspace/analysis/controller-lowbatt-notif.md`.
-
-## frame-screenshot-format.sh — screenshot output format / destination
-
-Two surfaces:
-
-1. **In-VR screenshots (compositor).** The compositor saves a PNG to
-   `<runtime>/screenshots` (it resolves `../../screenshots` against its CWD).
-   With the default `/opt/steamvr` runtime that directory is missing *and*
-   read-only, so the PNG write fails silently and the only artifact left is
-   the JPG the Steam client encodes from the submitted frame.
-   ```bash
-   sudo bash frame-screenshot-format.sh png-dir on      # one-time; see below
-   sudo bash frame-screenshot-format.sh png-dir status
-   sudo bash frame-screenshot-format.sh png-dir off
-   ```
-   `png-dir on` creates the mountpoint and bind-mounts
-   `/home/steamos/screenshots/vr` (override with `SCREENSHOT_DIR=…`) onto it
-   via a systemd mount unit — compositor PNGs then survive and land in your
-   home. Needs `sudo steamos-readonly disable` once (to create the
-   mountpoint + unit under `/etc`); `steamos-readonly enable` can be re-run
-   afterwards, the mount persists across boots. Steam's own library copy
-   stays JPG — that encoder lives in the Steam client, not SteamVR.
-   If the active runtime is a Steam-managed one under `/home`, its
-   screenshots dir is already writable (no mount needed; `status` says so).
-
-2. **Dev `screenshot` helper** (`/etc/bashrc.d/vrshortcuts.sh`, ffmpeg grab of
-   the `/dev/video99` loopback): format follows the default filename extension.
-   ```bash
-   sudo bash frame-screenshot-format.sh png      # helper defaults to .png
-   sudo bash frame-screenshot-format.sh jpg      # ...or .jpg
-   sudo bash frame-screenshot-format.sh status
-   sudo bash frame-screenshot-format.sh restore  # undo helper edit + mount
-   ```
-   Backup: `vrshortcuts.sh.sshotfmt-backup`. An explicit
-   `screenshot /path/name.ext` argument always wins. OS updates revert
-   (re-run after updating).
 
 ## Deploying to the Frame
 ```bash

@@ -124,7 +124,9 @@ VRMON=$RUNTIME/bin/linuxarm64/vrmonitor
 writable_root_note() {
   if [ ! -w "$RUNTIME" ]; then
     echo "ERROR: $RUNTIME is not writable (read-only/verity rootfs?)." >&2
-    echo "Run once first:  sudo steamos-readonly disable   (re-enable afterwards)" >&2
+    echo "No-root alternative: 'frame-screenshot-format.sh shadow on' builds a writable" >&2
+    echo "shadow runtime under ~ (real vrmonitor copy + setpath), then re-run this." >&2
+    echo "Or patch /opt/steamvr with:  sudo steamos-readonly disable   (re-enable afterwards)" >&2
     exit 1
   fi
 }
