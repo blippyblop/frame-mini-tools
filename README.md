@@ -1,3 +1,7 @@
+# Important:
+
+None of this shit is tested
+
 # tools/frame — on-Frame maintenance scripts
 
 Scripts you copy to the Steam Frame headset and run there (SteamOS).
